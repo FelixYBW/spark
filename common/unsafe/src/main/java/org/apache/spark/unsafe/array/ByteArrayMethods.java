@@ -50,6 +50,10 @@ public class ByteArrayMethods {
    * @return true if the arrays are equal, false otherwise
    */
   public static boolean arrayEquals(
+      Object leftBase, long leftOffset, Object rightBase, long rightOffset, final long length, boolean skip) {
+      return false;
+  }
+  public static boolean arrayEquals(
       Object leftBase, long leftOffset, Object rightBase, long rightOffset, final long length) {
     int i = 0;
 
