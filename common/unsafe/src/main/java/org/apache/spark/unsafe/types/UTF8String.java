@@ -757,9 +757,6 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
     if (v.numBytes() == 0) {
       return 0;
     }
-    if (v.numBytes == 1 && numBytes > 100){
-      return -1;
-    }
     // locate to the start position.
     int i = 0; // position in byte
     int c = 0; // position in character
@@ -773,11 +770,14 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
         return -1;
       }
       if (v.numBytes == 1 && numBytes > 100){
-	  if (false /*&& ByteArrayMethods.arrayEquals(base, offset + i, v.base, v.offset, v.numBytes, true)*/) {
-	    return c;
+        for (int lp=0; lp<100; lp++){
+	  if (ByteArrayMethods.arrayEquals(base, offset + i, v.base, v.offset, v.numBytes, true)) {
+	    return -1;
 	  }
+	}
+	return -1;
       } else {
-	  if (ByteArrayMethods.arrayEquals(base, offset + i, v.base, v.offset, v.numBytes)) {
+	if (ByteArrayMethods.arrayEquals(base, offset + i, v.base, v.offset, v.numBytes)) {
           return c;
         }
       }
