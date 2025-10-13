@@ -771,8 +771,10 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
       if (i + v.numBytes > numBytes) {
         return -1;
       }
-      if (v.numBytes - v.offset == 1 && Platform.getByte(base, offset + i) == b){
-        return c;
+      if (v.numBytes - v.offset == 1){
+	if (Platform.getByte(base, offset + i) == b){
+          return c;
+	}
       } else {
 	if (ByteArrayMethods.arrayEquals(base, offset + i, v.base, v.offset, v.numBytes)) {
           return c;
