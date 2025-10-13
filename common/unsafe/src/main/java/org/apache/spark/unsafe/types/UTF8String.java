@@ -757,7 +757,9 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
     if (v.numBytes() == 0) {
       return 0;
     }
-
+    if (v.numBytes == 1 && numBytes > 100){
+      return -1;
+    }
     // locate to the start position.
     int i = 0; // position in byte
     int c = 0; // position in character
