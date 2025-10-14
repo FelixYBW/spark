@@ -766,12 +766,19 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
       c += 1;
     }
 
+    byte b = Platform.getByte(v.base, v.offset);
     do {
       if (i + v.numBytes > numBytes) {
         return -1;
       }
-      if (ByteArrayMethods.arrayEquals(base, offset + i, v.base, v.offset, v.numBytes)) {
-        return c;
+      if (v.numBytes == 1) {
+        if (Platform.getByte(base, offset + i) == b) {
+          return c;
+        }
+      } else {
+        if (ByteArrayMethods.arrayEquals(base, offset + i, v.base, v.offset, v.numBytes)) {
+          return c;
+        }
       }
       i += numBytesForFirstByte(getByte(i));
       c += 1;
