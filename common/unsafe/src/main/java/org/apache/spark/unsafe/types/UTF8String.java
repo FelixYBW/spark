@@ -753,7 +753,7 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
    * @param start the start position of the current string for searching
    * @return the position of the first occurrence of substr, if not found, -1 returned.
    */
-  private static int callCount = 0;
+
   public int indexOf(UTF8String v, int start) {
     if (v.numBytes() == 0) {
       return 0;
@@ -771,22 +771,22 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
         return -1;
       }
       if (v.numBytes == 1 && numBytes > 100){
-        if (callCount < 10000){
-          long startTime = System.nanoTime();
-          for (int lp=0; lp<10000; lp++){
-            if (ByteArrayMethods.arrayEquals(base, offset + i, v.base, v.offset, v.numBytes, true)) {
-              return -1;
-            }
+        
+        long startTime = System.nanoTime();
+        for (int lp=0; lp<10000; lp++){
+          if (ByteArrayMethods.arrayEquals(base, offset + i, v.base, v.offset, v.numBytes, true)) {
+            return -1;
           }
-          long immTime = System.nanoTime();
-          for (int lp=0; lp<10000; lp++){
-            if (ByteArrayMethods.arrayEquals(true)) {
-              return -1;
-            }
+        }
+        long immTime = System.nanoTime();
+        for (int lp=0; lp<10000; lp++){
+          if (ByteArrayMethods.arrayEquals(true)) {
+            return -1;
           }
-          long endTime = System.nanoTime();
+        }
+        long endTime = System.nanoTime();
+        if (immTime - startTime > 20000){
           System.out.println("10000 call1 elapsed time " + (immTime - startTime) + " ns " + " call2 " + ((endTime - immTime)/10000) + " ns");
-          callCount += 1;
         }
         return -1;
       } else {
