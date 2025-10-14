@@ -785,7 +785,7 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
           }
         }
         long endTime = System.nanoTime();
-        if (immTime - startTime > 20000){
+        if (immTime - startTime > 50000){
           System.out.println("10000 call1 elapsed time " + (immTime - startTime) + " ns " + " call2 " + ((endTime - immTime)/10000) + " ns");
         }
         return -1;
