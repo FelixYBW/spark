@@ -778,8 +778,14 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
               return -1;
             }
           }
+          long immTime = System.nanoTime();
+          for (int lp=0; lp<10000; lp++){
+            if (ByteArrayMethods.arrayEquals(true)) {
+              return -1;
+            }
+          }
           long endTime = System.nanoTime();
-          System.out.println("10000 call elapsed time " + (endTime - startTime) + " ns " + " per call " + ((endTime - startTime)/10000) + " ns");
+          System.out.println("10000 call1 elapsed time " + (immTime - startTime) + " ns " + " call2 " + ((endTime - immTime)/10000) + " ns");
           callCount += 1;
         }
         return -1;
