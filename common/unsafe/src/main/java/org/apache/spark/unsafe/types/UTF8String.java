@@ -780,13 +780,13 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
         }
         long immTime = System.nanoTime();
         for (int lp=0; lp<10000; lp++){
-          if (ByteArrayMethods.arrayEquals(true)) {
+          if (ByteArrayMethods.arrayEquals()) {
             return -1;
           }
         }
         long endTime = System.nanoTime();
         if (immTime - startTime > 50000){
-          System.out.println("10000 call1 elapsed time " + (immTime - startTime) + " ns " + " call2 " + ((endTime - immTime)/10000) + " ns");
+          System.out.println("10000 call1 elapsed time " + (immTime - startTime) + " ns " + " call2 " + ((endTime - immTime)) + " ns");
         }
         return -1;
       } else {

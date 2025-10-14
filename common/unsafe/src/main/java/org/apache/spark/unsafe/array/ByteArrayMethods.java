@@ -53,7 +53,7 @@ public class ByteArrayMethods {
       Object leftBase, long leftOffset, Object rightBase, long rightOffset, final long length, boolean skip) {
       return false;
   }
-  public static boolean arrayEquals(boolean skip) {
+  public static boolean arrayEquals() {
       return false;
   }
   public static boolean arrayEquals(
