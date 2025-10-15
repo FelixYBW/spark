@@ -771,8 +771,9 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
       if (i + v.numBytes > numBytes) {
         return -1;
       }
+      byte sb = getByte(i);
       if (v.numBytes == 1) {
-        if (Platform.getByte(base, offset + i) == b) {
+        if (sb == b) {
           return c;
         }
       } else {
@@ -780,7 +781,7 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
           return c;
         }
       }
-      i += numBytesForFirstByte(getByte(i));
+      i += numBytesForFirstByte(sb);
       c += 1;
     } while (i < numBytes);
 
