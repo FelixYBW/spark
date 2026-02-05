@@ -57,21 +57,21 @@ object FilePartition extends Logging {
     // Calculate total bytes and number of partitions
     val totalBytes = partitionedFiles.map(_.length + openCostInBytes).sum
     val numPartitions = Math.max(1, (totalBytes / maxSplitBytes).toInt)
-    
+
     // Initialize partitions with ArrayBuffers for files and size tracking
     val partitionFiles = Array.fill(numPartitions)(new ArrayBuffer[PartitionedFile])
     val partitionSizes = Array.fill(numPartitions)(0L)
-    
+
     // Sort files from large to small
     val sortedFiles = partitionedFiles.sortBy(_.length)(Ordering[Long].reverse)
-    
+
     // Assign files to partitions using round-robin with size check
     var currentPartitionIndex = 0
     sortedFiles.foreach { file =>
       val fileSize = file.length + openCostInBytes
       var attempts = 0
       var placed = false
-      
+
       // Try to place file in partitions round-robin style
       while (attempts < numPartitions && !placed) {
         val partIndex = (currentPartitionIndex + attempts) % numPartitions
@@ -84,7 +84,7 @@ object FilePartition extends Logging {
           attempts += 1
         }
       }
-      
+
       // If file couldn't be placed in any partition without exceeding maxSplitBytes,
       // place it in the partition with the smallest current size
       if (!placed) {
@@ -94,7 +94,7 @@ object FilePartition extends Logging {
         currentPartitionIndex = (minSizePartIndex + 1) % numPartitions
       }
     }
-    
+
     // Create FilePartition objects from non-empty partitions
     partitionFiles.zipWithIndex.filter(_._1.nonEmpty).map { case (files, index) =>
       FilePartition(index, files.toArray)
