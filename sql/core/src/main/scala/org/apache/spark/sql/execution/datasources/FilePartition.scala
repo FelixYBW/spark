@@ -121,14 +121,9 @@ object FilePartition extends Logging {
       .getOrElse(sparkSession.leafNodeDefaultParallelism)
     val totalBytes = selectedPartitions.flatMap(_.files.map(_.getLen + openCostInBytes)).sum
 
-    // If totalBytes/maxPartNum < defaultMaxSplitBytes, return maxPartNum
-    if (maxPartNum.exists(totalBytes / _ < defaultMaxSplitBytes)) {
-      return totalBytes / maxPartNum.get
-    }
-
     // Calculate splitBytes and adjust minPartitionNum
     var splitBytes = totalBytes / minPartitionNum
-    while (splitBytes > defaultMaxSplitBytes) {
+    while (splitBytes > defaultMaxSplitBytes && maxPartNum.exists(minPartitionNum < _)) {
       minPartitionNum *= 2
       splitBytes = totalBytes / minPartitionNum
     }
