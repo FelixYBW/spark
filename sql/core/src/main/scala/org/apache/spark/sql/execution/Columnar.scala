@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.execution
 
-import org.apache.spark.broadcast
+import org.apache.spark.{broadcast, SparkException}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, SortOrder, SpecializedGetters}
@@ -26,8 +26,7 @@ import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.errors.ExecutionErrors
-import org.apache.spark.sql.execution.command.DataWritingCommandExec
-import org.apache.spark.sql.execution.datasources.V1WriteCommand
+import org.apache.spark.sql.execution.convention.{BatchType, Convention, ConventionReq, RowType, TransitionGraph}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.execution.vectorized.WritableColumnVector
 import org.apache.spark.sql.types._
@@ -504,67 +503,76 @@ case class ApplyColumnarRulesAndInsertTransitions(
     outputsColumnar: Boolean)
   extends Rule[SparkPlan] {
 
-  /**
-   * Ensures columnar output on the input query plan. Transitions will be inserted
-   * on demand.
-   */
-  private def ensureOutputsColumnar(plan: SparkPlan): SparkPlan = {
-    if (!plan.supportsColumnar) {
-      // The tree feels kind of backwards
-      // Columnar Processing will start here, so transition from row to columnar
-      RowToColumnarExec(ensureOutputsRowBased(plan))
-    } else if (!plan.isInstanceOf[RowToColumnarTransition]) {
-      plan.withNewChildren(plan.children.map(ensureOutputsColumnar))
-    } else {
-      plan
-    }
-  }
+  private def isTransition(plan: SparkPlan): Boolean =
+    plan.isInstanceOf[ColumnarToRowTransition] || plan.isInstanceOf[RowToColumnarTransition]
 
   /**
-   * Ensures row-based output on the input query plan. Transitions will be inserted
-   * on demand.
+   * Inserts the transitions needed for `plan` to output a convention satisfying `req`, and
+   * recursively for its children.
+   *
+   * The plan is executed row-based or columnar, whichever needs the cheapest transition path to
+   * `req` in the [[TransitionGraph]]. Its children are then required to satisfy
+   * `plan.requiredChildConventions(outputsColumnar)`. Existing transitions are kept as they are.
    */
-  private def ensureOutputsRowBased(plan: SparkPlan): SparkPlan = {
-    if (plan.supportsColumnar && !plan.supportsRowBased) {
-      // `outputsColumnar` is false but the plan only outputs columnar format, so add a
-      // to-row transition here.
-      ColumnarToRowExec(ensureOutputsColumnar(plan))
-    } else if (!plan.isInstanceOf[ColumnarToRowTransition]) {
-      val outputsColumnar = plan match {
-        // With planned write, the write command invokes child plan's `executeWrite` which is
-        // neither columnar nor row-based.
-        case write: DataWritingCommandExec
-            if write.cmd.isInstanceOf[V1WriteCommand] && conf.plannedWriteEnabled =>
-          write.child.supportsColumnar
-        // If it is not required to output columnar (`outputsColumnar` is false), and the plan
-        // supports row-based and columnar, we don't need to output row-based data on its children
-        // nodes. So we set `outputsColumnar` to true.
-        case _ if plan.supportsColumnar && plan.supportsRowBased => true
-        case _ =>
-          false
-      }
-      plan.withNewChildren(plan.children.map(insertTransitions(_, outputsColumnar)))
-    } else {
+  private def insertTransitions(plan: SparkPlan, req: ConventionReq): SparkPlan = {
+    val conv = ApplyColumnarRulesAndInsertTransitions.conventionOf(plan)
+    val (outputsColumnar, transitions) = req match {
+      case ConventionReq.Any => (conv.supportsBatch, Nil)
+      case _ if req.isSatisfiedBy(conv) =>
+        (req.isInstanceOf[ConventionReq.Batch], Nil)
+      case _ =>
+        val to = req match {
+          case ConventionReq.Row(t) => t
+          case ConventionReq.Batch(t) => t
+          case ConventionReq.Any => throw new IllegalStateException()
+        }
+        val candidates =
+          (if (conv.supportsRow) TransitionGraph.findPath(conv.rowType, to).map((false, _))
+          else None).toSeq ++
+          (if (conv.supportsBatch) TransitionGraph.findPath(conv.batchType, to).map((true, _))
+          else None).toSeq
+        if (candidates.isEmpty) {
+          throw SparkException.internalError(
+            s"No transition from $conv to $req for plan:\n${plan.treeString}")
+        }
+        candidates.minBy(_._2.map(_.cost).sum)
+    }
+    val newPlan = if (isTransition(plan)) {
       plan
-    }
-  }
-
-  /**
-   * Inserts RowToColumnarExecs and ColumnarToRowExecs where needed.
-   */
-  private def insertTransitions(plan: SparkPlan, outputsColumnar: Boolean): SparkPlan = {
-    if (outputsColumnar) {
-      ensureOutputsColumnar(plan)
     } else {
-      ensureOutputsRowBased(plan)
+      val childReqs = plan.requiredChildConventions(outputsColumnar)
+      assert(childReqs.size == plan.children.size,
+        s"${plan.nodeName} requires ${childReqs.size} child conventions for " +
+          s"${plan.children.size} children")
+      plan.withNewChildren(plan.children.zip(childReqs).map {
+        case (child, childReq) => insertTransitions(child, childReq)
+      })
     }
+    transitions.foldLeft(newPlan)((p, t) => t.apply(p))
   }
 
   def apply(plan: SparkPlan): SparkPlan = {
     var preInsertPlan: SparkPlan = plan
     columnarRules.foreach(r => preInsertPlan = r.preColumnarTransitions(preInsertPlan))
-    var postInsertPlan = insertTransitions(preInsertPlan, outputsColumnar)
+    val req = if (outputsColumnar) ConventionReq.vanillaBatch else ConventionReq.vanillaRow
+    var postInsertPlan = insertTransitions(preInsertPlan, req)
     columnarRules.reverse.foreach(r => postInsertPlan = r.postColumnarTransitions(postInsertPlan))
     postInsertPlan
+  }
+}
+
+object ApplyColumnarRulesAndInsertTransitions {
+  /**
+   * The convention of `plan` used for transition insertion. A plan supporting neither row-based
+   * nor columnar execution (e.g. a `UnionExec` of row-based and columnar-only children) is
+   * executed row-based, with row-based children.
+   */
+  private[execution] def conventionOf(plan: SparkPlan): Convention = {
+    val conv = plan.convention
+    if (!conv.supportsRow && !conv.supportsBatch) {
+      Convention(RowType.VanillaRowType, BatchType.None)
+    } else {
+      conv
+    }
   }
 }

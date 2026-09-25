@@ -37,6 +37,7 @@ import org.apache.spark.sql.catalyst.trees.{BinaryLike, LeafLike, TreeNodeTag, U
 import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.connector.write.WriterCommitMessage
 import org.apache.spark.sql.errors.QueryExecutionErrors
+import org.apache.spark.sql.execution.convention.{Convention, ConventionReq}
 import org.apache.spark.sql.execution.datasources.WriteFilesSpec
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.internal.SQLConf
@@ -90,6 +91,34 @@ abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializ
    * which execution to be called during query planning.
    */
   def supportsColumnar: Boolean = false
+
+  /**
+   * The row type and batch type this plan outputs. By default it is derived from
+   * `supportsRowBased` / `supportsColumnar`, i.e. Spark's vanilla row and columnar layouts.
+   * Plans producing a specific columnar layout (e.g. `BatchType.ArrowBatchType`, or a type
+   * registered by a plugin) override it, and Spark inserts the registered transitions between
+   * plans with different conventions.
+   */
+  def convention: Convention = Convention.vanilla(supportsRowBased, supportsColumnar)
+
+  /**
+   * The conventions this plan requires from its children, given whether it is executed columnar
+   * (`outputsColumnar`) or row-based. By default, children follow this plan's own output
+   * convention; a plan supporting both row-based and columnar execution keeps columnar children.
+   */
+  def requiredChildConventions(outputsColumnar: Boolean): Seq[ConventionReq] = {
+    val conv = convention
+    val req = if (outputsColumnar || (conv.supportsBatch && conv.supportsRow)) {
+      // A plan supporting both row-based and columnar execution keeps columnar children even when
+      // it outputs rows.
+      ConventionReq.Batch(conv.batchType)
+    } else if (conv.supportsRow) {
+      ConventionReq.Row(conv.rowType)
+    } else {
+      ConventionReq.vanillaRow
+    }
+    children.map(_ => req)
+  }
 
   /**
    * The exact java types of the columns that are output in columnar processing mode. This
