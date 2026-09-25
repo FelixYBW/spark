@@ -30,7 +30,8 @@ import org.apache.spark.sql.catalyst.trees.{LeafLike, UnaryLike}
 import org.apache.spark.sql.connector.ExternalCommandRunner
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.{CommandExecutionMode, ExplainMode, LeafExecNode, SparkPlan, UnaryExecNode}
-import org.apache.spark.sql.execution.datasources.DataSource
+import org.apache.spark.sql.execution.convention.ConventionReq
+import org.apache.spark.sql.execution.datasources.{DataSource, V1WriteCommand}
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.execution.streaming.IncrementalExecution
 import org.apache.spark.sql.types._
@@ -109,6 +110,14 @@ case class ExecutedCommandExec(cmd: RunnableCommand) extends LeafExecNode {
  */
 case class DataWritingCommandExec(cmd: DataWritingCommand, child: SparkPlan)
   extends UnaryExecNode {
+
+  // With planned write, the write command invokes child plan's `executeWrite` which is neither
+  // columnar nor row-based.
+  override def requiredChildConventions(outputsColumnar: Boolean): Seq[ConventionReq] =
+    cmd match {
+      case _: V1WriteCommand if conf.plannedWriteEnabled => Seq(ConventionReq.Any)
+      case _ => super.requiredChildConventions(outputsColumnar)
+    }
 
   override lazy val metrics: Map[String, SQLMetric] = cmd.metrics
 
