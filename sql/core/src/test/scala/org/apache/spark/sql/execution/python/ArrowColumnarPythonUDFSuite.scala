@@ -17,6 +17,10 @@
 
 package org.apache.spark.sql.execution.python
 
+import org.apache.arrow.memory.AllocationListener
+import org.apache.arrow.vector.IntVector
+
+import org.apache.spark.TaskContext
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, IntegratedUDFTestUtils}
 import org.apache.spark.sql.catalyst.InternalRow
@@ -26,7 +30,8 @@ import org.apache.spark.sql.execution.convention.{BatchType, Convention, Convent
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.StringType
-import org.apache.spark.sql.vectorized.{ArrowColumnVector, ColumnarBatch}
+import org.apache.spark.sql.util.ArrowUtils
+import org.apache.spark.sql.vectorized.{ArrowColumnVector, ColumnarBatch, ColumnVector}
 
 /**
  * End-to-end tests for the Arrow columnar Python UDF input path.
@@ -226,6 +231,31 @@ class ArrowColumnarPythonUDFSuite extends SharedSparkSession {
 
       val rows = plan.executeCollect().map(r => (r.getInt(0), r.getUTF8String(4).toString))
       assert(rows.sorted.toSeq == (0 until 5000).map(i => (i, s"row_$i")))
+    }
+  }
+
+  test("Arrow batch owner: buffers tracked by an allocation listener stay in place") {
+    val tracked = ArrowUtils.rootAllocator.newChildAllocator(
+      "tracked", new AllocationListener {}, 0, Long.MaxValue)
+    val untracked = ArrowUtils.rootAllocator.newChildAllocator("untracked", 0, Long.MaxValue)
+    val owner = new ArrowBatchOwner(TaskContext.empty())
+    try {
+      Seq(tracked -> true, untracked -> false).foreach { case (producer, stays) =>
+        val vector = new IntVector("a", producer)
+        vector.allocateNew(4)
+        vector.setValueCount(4)
+        val owned = owner.own(
+          new ColumnarBatch(Array[ColumnVector](new ArrowColumnVector(vector)), 4))
+        val ownedVector = owned.column(0).asInstanceOf[ArrowColumnVector].getValueVector
+        assert((ownedVector.getAllocator eq producer) == stays)
+        assert(ownedVector.getValueCount == 4 && vector.getValueCount == 0)
+        vector.close()
+      }
+      assert(untracked.getAllocatedMemory == 0)
+    } finally {
+      owner.close()
+      tracked.close()
+      untracked.close()
     }
   }
 

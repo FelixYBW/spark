@@ -22,7 +22,7 @@ import java.util.{ArrayDeque, IdentityHashMap}
 import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters._
 
-import org.apache.arrow.memory.BufferAllocator
+import org.apache.arrow.memory.{AllocationListener, BufferAllocator}
 import org.apache.arrow.vector.ValueVector
 
 import org.apache.spark.{PartitionEvaluator, PartitionEvaluatorFactory, SparkEnv, SparkException, TaskContext}
@@ -433,9 +433,13 @@ private[python] class ArrowBatchOwner(context: TaskContext) {
     }
   }
 
-  private def allocatorFor(vector: ValueVector): BufferAllocator = {
-    if (vector.getAllocator.getRoot ne ArrowUtils.rootAllocator) {
-      vector.getAllocator
+  private[python] def allocatorFor(vector: ValueVector): BufferAllocator = {
+    val producer = vector.getAllocator
+    // Allocation listeners are not notified of transfers: the buffers of a producer accounting
+    // its memory with one stay in its allocator, where their release is accounted.
+    if ((producer.getRoot ne ArrowUtils.rootAllocator) ||
+        (producer.getListener ne AllocationListener.NOOP)) {
+      producer
     } else {
       if (allocator == null) {
         allocator = ArrowUtils.rootAllocator.newChildAllocator(

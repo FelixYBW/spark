@@ -126,8 +126,9 @@ object BatchType {
    * (`ValueVector.getTransferPair`), without copying, and closes them when done. The producer's
    * vectors are then left empty, so they must be reallocated before being reused. The buffers are
    * transferred to an allocator of the consumer when it shares the root allocator of the
-   * producer's one, e.g. `ArrowUtils.rootAllocator`. Otherwise they stay in the producer's
-   * allocator, which must then be kept open until the task completes.
+   * producer's one, e.g. `ArrowUtils.rootAllocator`, and the producer's allocator has no
+   * allocation listener, which would not be notified of the transfer. Otherwise they stay in the
+   * producer's allocator, which must then be kept open until the task completes.
    */
   case object ArrowBatchType extends BatchType {
     override protected def registerTransitions(): Unit = {
