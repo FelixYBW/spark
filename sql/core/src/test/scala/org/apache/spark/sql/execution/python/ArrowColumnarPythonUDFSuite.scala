@@ -17,11 +17,16 @@
 
 package org.apache.spark.sql.execution.python
 
-import org.apache.spark.sql.IntegratedUDFTestUtils
-import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.{DataFrame, IntegratedUDFTestUtils}
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.execution.{ApplyColumnarRulesAndInsertTransitions, SparkPlan, UnaryExecNode}
+import org.apache.spark.sql.execution.convention.{BatchType, Convention, ConventionReq, RowType}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.StringType
+import org.apache.spark.sql.vectorized.{ArrowColumnVector, ColumnarBatch}
 
 /**
  * End-to-end tests for the Arrow columnar Python UDF input path.
@@ -32,6 +37,7 @@ import org.apache.spark.sql.types.StringType
  */
 class ArrowColumnarPythonUDFSuite extends SharedSparkSession {
 
+  import ArrowColumnarPythonUDFSuite._
   import IntegratedUDFTestUtils._
 
   private val arrowSource =
@@ -79,6 +85,8 @@ class ArrowColumnarPythonUDFSuite extends SharedSparkSession {
       assert(arrowExec.child.supportsColumnar,
         "ArrowEvalPythonExec child should support columnar " +
           s"when reading from Arrow-backed source:\n$plan")
+      // The scan declares vanilla batches: Arrow vectors are only detected at runtime.
+      assert(arrowExec.convention.batchType == BatchType.VanillaBatchType)
     }
   }
 
@@ -177,5 +185,80 @@ class ArrowColumnarPythonUDFSuite extends SharedSparkSession {
         assert(row.getString(1) == i.toString)
       }
     }
+  }
+
+  /**
+   * Plans the `ArrowEvalPythonExec` of `df` again, with its Arrow-backed scan child declared as
+   * [[BatchType.ArrowBatchType]].
+   */
+  private def planWithArrowBatchTypeChild(df: DataFrame): SparkPlan = {
+    val exec = collectNodes[ArrowEvalPythonExec](df.queryExecution.executedPlan).head
+    assert(exec.child.supportsColumnar, s"Expected the Arrow-backed scan as child:\n$exec")
+    ApplyColumnarRulesAndInsertTransitions(Nil, outputsColumnar = false)
+      .apply(exec.copy(child = ArrowBatchTypeExec(exec.child)))
+  }
+
+  test("Arrow batch type child: Arrow batches in and out") {
+    assume(shouldTestPandasUDFs)
+    withSQLConf(
+        SQLConf.ARROW_PYSPARK_EXECUTION_ENABLED.key -> "true",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+      val pandasUDF = TestScalarPandasUDF(
+        name = "arrow_type_udf", returnType = Some(StringType))
+      registerTestUDF(pandasUDF, spark)
+
+      val df = readArrowSource(numRows = 3000, numPartitions = 3)
+        .selectExpr("id", "name", "value", "data", "arrow_type_udf(name) as u")
+      val plan = planWithArrowBatchTypeChild(df)
+      // Arrow batches are required from the child, with no transition in between.
+      plan match {
+        case p: ArrowEvalPythonExec =>
+          assert(p.convention == Convention(RowType.VanillaRowType, BatchType.ArrowBatchType))
+          assert(p.child.isInstanceOf[ArrowBatchTypeExec], plan)
+        case _ => fail(s"Unexpected plan:\n$plan")
+      }
+
+      val allArrow = plan.executeColumnar().mapPartitionsInternal { iter =>
+        iter.map(b => (0 until b.numCols()).forall(b.column(_).isInstanceOf[ArrowColumnVector]))
+      }.collect()
+      assert(allArrow.nonEmpty && allArrow.forall(identity))
+    }
+  }
+
+  test("Arrow batch type child: non-column UDF inputs keep vanilla batches") {
+    assume(shouldTestPandasUDFs)
+    withSQLConf(
+        SQLConf.ARROW_PYSPARK_EXECUTION_ENABLED.key -> "true",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+      val pandasUDF = TestScalarPandasUDF(
+        name = "arrow_expr_udf", returnType = Some(StringType))
+      registerTestUDF(pandasUDF, spark)
+
+      val df = readArrowSource(numRows = 10)
+        .selectExpr("id", "name", "value", "data", "arrow_expr_udf(id + 1) as u")
+      val plan = planWithArrowBatchTypeChild(df)
+      val exec = collectNodes[ArrowEvalPythonExec](plan).head
+      assert(exec.convention.batchType == BatchType.VanillaBatchType)
+      val rows = plan.executeCollect().map(r => (r.getInt(0), r.getUTF8String(4).toString))
+      assert(rows.sorted.toSeq == (0 until 10).map(i => (i, (i + 1).toString)))
+    }
+  }
+}
+
+object ArrowColumnarPythonUDFSuite {
+  /** Declares the Arrow-backed batches of its vanilla columnar child as Arrow batch type. */
+  case class ArrowBatchTypeExec(child: SparkPlan) extends UnaryExecNode {
+    override def output: Seq[Attribute] = child.output
+    override def supportsColumnar: Boolean = true
+    override def supportsRowBased: Boolean = false
+    override def convention: Convention = Convention(RowType.None, BatchType.ArrowBatchType)
+    override def requiredChildConventions(outputsColumnar: Boolean): Seq[ConventionReq] =
+      Seq(ConventionReq.vanillaBatch)
+
+    override protected def doExecute(): RDD[InternalRow] =
+      throw new UnsupportedOperationException
+    override protected def doExecuteColumnar(): RDD[ColumnarBatch] = child.executeColumnar()
+    override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan =
+      copy(child = newChild)
   }
 }

@@ -59,6 +59,10 @@ import org.apache.spark.util.Utils
  *    [[BasicPythonArrowInput]]. Uses [[HybridRowQueue]] for pass-through
  *    and converts joined rows back to [[ColumnarBatch]].
  *
+ * When the child declares [[org.apache.spark.sql.execution.convention.BatchType.ArrowBatchType]]
+ * (`arrowBatchInput`), the input is known to be Arrow-backed and path 1 is always taken, so the
+ * output is Arrow-backed too.
+ *
  * TODO: Add a physical plan rule that inserts a ProjectExec before
  *   ArrowEvalPythonExec to pre-evaluate complex UDF input expressions
  *   into simple column references. This would eliminate path 3.
@@ -75,7 +79,8 @@ private[python] class ColumnarArrowEvalPythonEvaluatorFactory(
     pythonRunnerConf: Map[String, String],
     pythonMetrics: Map[String, SQLMetric],
     jobArtifactUUID: Option[String],
-    sessionUUID: Option[String])
+    sessionUUID: Option[String],
+    arrowBatchInput: Boolean)
   extends PartitionEvaluatorFactory[ColumnarBatch, ColumnarBatch] {
 
   override def createEvaluator()
@@ -143,9 +148,12 @@ private[python] class ColumnarArrowEvalPythonEvaluatorFactory(
 
       val inputColumnIndices = resolveColumnIndices(allInputs.toSeq)
 
-      // Peek at first batch to check if Arrow-backed.
+      assert(!arrowBatchInput || inputColumnIndices.isDefined,
+        "UDF inputs of an Arrow batch type child must be columns of it")
+
+      // Peek at first batch to check if Arrow-backed, unless the child declares Arrow batches.
       val peekIter = new PeekableIterator(inputIter)
-      val isArrow = peekIter.peek().exists { batch =>
+      val isArrow = arrowBatchInput || peekIter.peek().exists { batch =>
         batch.numCols() > 0 &&
           batch.column(0).isInstanceOf[ArrowColumnVector]
       }

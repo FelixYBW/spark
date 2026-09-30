@@ -26,9 +26,10 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.convention.{BatchType, Convention, RowType, TransitionGraph}
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.execution.python.EvalPythonExec.ArgumentMetadata
-import org.apache.spark.sql.types.{StructType, UserDefinedType}
+import org.apache.spark.sql.types.{DataType, StructType, UserDefinedType}
 import org.apache.spark.sql.types.DataType.equalsIgnoreCompatibleCollation
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
@@ -91,16 +92,39 @@ case class ArrowEvalPythonExec(
     }
   }
 
+  /**
+   * Whether the child outputs, or can be converted to, [[BatchType.ArrowBatchType]] batches, and
+   * every UDF input is one of its columns. The UDF inputs are then serialized to the Python worker
+   * from the child's Arrow vectors, and this plan outputs Arrow batches too: the child's columns
+   * followed by the UDF results. A vanilla columnar child keeps the behavior below, where the
+   * input is checked for Arrow vectors at runtime.
+   */
+  private[python] lazy val arrowBatchInput: Boolean = {
+    val childBatchType = child.convention.batchType
+    conf.arrowPySparkUDFColumnarInputEnabled &&
+      childBatchType != BatchType.None &&
+      childBatchType != BatchType.VanillaBatchType &&
+      TransitionGraph.findPath(childBatchType, BatchType.ArrowBatchType).isDefined &&
+      ArrowEvalPythonExec.inputsAreChildColumns(udfs, child.output)
+  }
+
   // When the child supports columnar output (e.g., Arrow-backed DSv2 connectors),
   // accept columnar input to avoid the ColumnarToRow -> ArrowWriter round-trip.
   // The Arrow FieldVectors are extracted directly from ArrowColumnVector and
   // serialized to IPC, bypassing the row-based ArrowWriter conversion.
   override def supportsColumnar: Boolean =
-    child.supportsColumnar && conf.arrowPySparkUDFColumnarInputEnabled
+    arrowBatchInput || (child.supportsColumnar && conf.arrowPySparkUDFColumnarInputEnabled)
   override def supportsRowBased: Boolean = true
 
+  override def convention: Convention = if (arrowBatchInput) {
+    // Requires Arrow batches from the child too, see `requiredChildConventions`.
+    Convention(RowType.VanillaRowType, BatchType.ArrowBatchType)
+  } else {
+    super.convention
+  }
+
   override protected def doExecute(): RDD[InternalRow] = {
-    if (child.supportsColumnar) {
+    if (arrowBatchInput || child.supportsColumnar) {
       // Columnar path: delegate to doExecuteColumnar, flatten to
       // UnsafeRow. ColumnarBatchRow from rowIterator() is NOT
       // UnsafeRow, and downstream operators (e.g., outer
@@ -139,7 +163,8 @@ case class ArrowEvalPythonExec(
       ArrowPythonRunner.getPythonRunnerConfMap(conf),
       pythonMetrics,
       jobArtifactUUID,
-      sessionUUID)
+      sessionUUID,
+      arrowBatchInput)
 
   override protected def evaluatorFactory: EvalPythonEvaluatorFactory = {
     new ArrowEvalPythonEvaluatorFactory(
@@ -216,5 +241,30 @@ class ArrowEvalPythonEvaluatorFactory(
       }
       batch.rowIterator.asScala
     }
+  }
+}
+
+object ArrowEvalPythonExec {
+  private def inputsOf(udf: PythonUDF): Seq[Expression] = udf.children match {
+    case Seq(u: PythonUDF) => inputsOf(u)
+    case children => children
+  }
+
+  /**
+   * Whether every input of `udfs` is a column of `childOutput`, and neither the inputs nor the
+   * results are user-defined types, which Arrow vectors hold as their SQL type.
+   */
+  private[python] def inputsAreChildColumns(
+      udfs: Seq[PythonUDF],
+      childOutput: Seq[Attribute]): Boolean = {
+    def hasUdt(dt: DataType): Boolean = dt.existsRecursively(_.isInstanceOf[UserDefinedType[_]])
+    val inputs = udfs.flatMap(inputsOf).map {
+      case NamedArgumentExpression(_, value) => value
+      case e => e
+    }
+    inputs.forall {
+      case a: AttributeReference => childOutput.exists(_.exprId == a.exprId)
+      case _ => false
+    } && !inputs.exists(e => hasUdt(e.dataType)) && !udfs.exists(u => hasUdt(u.dataType))
   }
 }
