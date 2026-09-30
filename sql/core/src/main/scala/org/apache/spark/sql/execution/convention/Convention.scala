@@ -119,6 +119,15 @@ object BatchType {
    * A `ColumnarBatch` whose columns are all
    * [[org.apache.spark.sql.vectorized.ArrowColumnVector]]s. Consumers can access the underlying
    * Arrow `FieldVector`s directly, e.g. to serialize them to Arrow IPC without conversion.
+   *
+   * Ownership: a batch is only valid until the next call to `hasNext` or `next` of the iterator
+   * it comes from, after which the producer may close or reuse its vectors. A consumer keeping a
+   * batch longer takes ownership of its buffers by transferring its vectors
+   * (`ValueVector.getTransferPair`), without copying, and closes them when done. The producer's
+   * vectors are then left empty, so they must be reallocated before being reused. The buffers are
+   * transferred to an allocator of the consumer when it shares the root allocator of the
+   * producer's one, e.g. `ArrowUtils.rootAllocator`. Otherwise they stay in the producer's
+   * allocator, which must then be kept open until the task completes.
    */
   case object ArrowBatchType extends BatchType {
     override protected def registerTransitions(): Unit = {

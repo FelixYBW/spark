@@ -207,7 +207,8 @@ class ArrowColumnarPythonUDFSuite extends SharedSparkSession {
         name = "arrow_type_udf", returnType = Some(StringType))
       registerTestUDF(pandasUDF, spark)
 
-      val df = readArrowSource(numRows = 3000, numPartitions = 3)
+      // Several batches per partition, each closed by the child once it has been consumed.
+      val df = readArrowSource(numRows = 5000, numPartitions = 3)
         .selectExpr("id", "name", "value", "data", "arrow_type_udf(name) as u")
       val plan = planWithArrowBatchTypeChild(df)
       // Arrow batches are required from the child, with no transition in between.
@@ -222,6 +223,9 @@ class ArrowColumnarPythonUDFSuite extends SharedSparkSession {
         iter.map(b => (0 until b.numCols()).forall(b.column(_).isInstanceOf[ArrowColumnVector]))
       }.collect()
       assert(allArrow.nonEmpty && allArrow.forall(identity))
+
+      val rows = plan.executeCollect().map(r => (r.getInt(0), r.getUTF8String(4).toString))
+      assert(rows.sorted.toSeq == (0 until 5000).map(i => (i, s"row_$i")))
     }
   }
 
@@ -246,7 +250,10 @@ class ArrowColumnarPythonUDFSuite extends SharedSparkSession {
 }
 
 object ArrowColumnarPythonUDFSuite {
-  /** Declares the Arrow-backed batches of its vanilla columnar child as Arrow batch type. */
+  /**
+   * Declares the Arrow-backed batches of its vanilla columnar child as Arrow batch type. As the
+   * Arrow batch type allows, each batch is closed once the consumer asks for the next one.
+   */
   case class ArrowBatchTypeExec(child: SparkPlan) extends UnaryExecNode {
     override def output: Seq[Attribute] = child.output
     override def supportsColumnar: Boolean = true
@@ -257,7 +264,30 @@ object ArrowColumnarPythonUDFSuite {
 
     override protected def doExecute(): RDD[InternalRow] =
       throw new UnsupportedOperationException
-    override protected def doExecuteColumnar(): RDD[ColumnarBatch] = child.executeColumnar()
+    override protected def doExecuteColumnar(): RDD[ColumnarBatch] =
+      child.executeColumnar().mapPartitionsInternal { iter =>
+        new Iterator[ColumnarBatch] {
+          private var last: ColumnarBatch = null
+
+          private def closeLast(): Unit = {
+            if (last != null) {
+              last.close()
+              last = null
+            }
+          }
+
+          override def hasNext: Boolean = {
+            closeLast()
+            iter.hasNext
+          }
+
+          override def next(): ColumnarBatch = {
+            closeLast()
+            last = iter.next()
+            last
+          }
+        }
+      }
     override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan =
       copy(child = newChild)
   }

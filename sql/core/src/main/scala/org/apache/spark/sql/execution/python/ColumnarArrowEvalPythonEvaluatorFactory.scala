@@ -17,12 +17,15 @@
 package org.apache.spark.sql.execution.python
 
 import java.io.File
-import java.util.ArrayDeque
+import java.util.{ArrayDeque, IdentityHashMap}
 
 import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters._
 
-import org.apache.spark.{PartitionEvaluator, PartitionEvaluatorFactory, SparkEnv, TaskContext}
+import org.apache.arrow.memory.BufferAllocator
+import org.apache.arrow.vector.ValueVector
+
+import org.apache.spark.{PartitionEvaluator, PartitionEvaluatorFactory, SparkEnv, SparkException, TaskContext}
 import org.apache.spark.api.python.ChainedPythonFunctions
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
@@ -33,6 +36,7 @@ import org.apache.spark.sql.execution.python.EvalPythonExec.ArgumentMetadata
 import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector
 import org.apache.spark.sql.types.{DataType, StructField, StructType, UserDefinedType}
 import org.apache.spark.sql.types.DataType.equalsIgnoreCompatibleCollation
+import org.apache.spark.sql.util.ArrowUtils
 import org.apache.spark.sql.vectorized.{ArrowColumnVector, ColumnarBatch, ColumnVector}
 import org.apache.spark.util.Utils
 
@@ -61,7 +65,9 @@ import org.apache.spark.util.Utils
  *
  * When the child declares [[org.apache.spark.sql.execution.convention.BatchType.ArrowBatchType]]
  * (`arrowBatchInput`), the input is known to be Arrow-backed and path 1 is always taken, so the
- * output is Arrow-backed too.
+ * output is Arrow-backed too. The input batches are then only valid until the next one is read, so
+ * path 1 takes ownership of their vectors with an [[ArrowBatchOwner]] until the output batch using
+ * them has been consumed.
  *
  * TODO: Add a physical plan rule that inserts a ProjectExec before
  *   ArrowEvalPythonExec to pre-evaluate complex UDF input expressions
@@ -182,8 +188,10 @@ private[python] class ColumnarArrowEvalPythonEvaluatorFactory(
     }
 
     /**
-     * Path 1: Arrow columnar. ColumnVector references are safe
-     * because Arrow vectors are independently allocated per batch.
+     * Path 1: Arrow columnar. For a vanilla columnar child, ColumnVector
+     * references are assumed safe because Arrow vectors are independently
+     * allocated per batch. For an Arrow batch type child, the input batches
+     * are owned until their output batch has been consumed.
      * Combines pass-through + UDF result columns into ColumnarBatch.
      */
     private def evalArrowColumnar(
@@ -198,7 +206,10 @@ private[python] class ColumnarArrowEvalPythonEvaluatorFactory(
       val passThruQueue =
         new ArrayDeque[(Array[ColumnVector], Int)]()
 
-      val bufferedIter = inputIter.map { batch =>
+      val owner = if (arrowBatchInput) Some(new ArrowBatchOwner(context)) else None
+
+      val bufferedIter = inputIter.map { input =>
+        val batch = owner.map(_.own(input)).getOrElse(input)
         val passThruCols = childOutput.indices.map(
           i => batch.column(i)).toArray
         passThruQueue.add((passThruCols, batch.numRows()))
@@ -214,7 +225,9 @@ private[python] class ColumnarArrowEvalPythonEvaluatorFactory(
       val resultIter = pyRunner.compute(
         bufferedIter, context.partitionId(), context)
 
-      resultIter.map { resultBatch =>
+      val outputIter = resultIter.map { resultBatch =>
+        // The previous output batch has been consumed.
+        owner.foreach(_.releaseOutput())
         validateOutputTypes(resultBatch, outputTypes)
         val numRows = resultBatch.numRows()
         val resultCols = (0 until resultBatch.numCols()).map(
@@ -224,6 +237,22 @@ private[python] class ColumnarArrowEvalPythonEvaluatorFactory(
           s"Batch size mismatch: pass-through has " +
             s"$passThruRows rows but UDF result has $numRows rows.")
         new ColumnarBatch(passThruCols ++ resultCols, numRows)
+      }
+      owner match {
+        case Some(o) =>
+          new Iterator[ColumnarBatch] {
+            override def hasNext: Boolean = {
+              val has = outputIter.hasNext
+              if (!has) {
+                // Release the owned batches now: at task completion, the producer's allocator may
+                // be closed first.
+                o.close()
+              }
+              has
+            }
+            override def next(): ColumnarBatch = outputIter.next()
+          }
+        case None => outputIter
       }
     }
 
@@ -337,6 +366,82 @@ private[python] class ColumnarArrowEvalPythonEvaluatorFactory(
           cb
         }
       }
+    }
+  }
+}
+
+/**
+ * Owns the input batches of an Arrow batch type child, see
+ * [[org.apache.spark.sql.execution.convention.BatchType.ArrowBatchType]], from when they are read
+ * until the output batch using them has been consumed.
+ */
+private[python] class ArrowBatchOwner(context: TaskContext) {
+  // Owned batches whose output batch has not been returned yet.
+  private val pending = new ArrayDeque[ColumnarBatch]()
+  // The owned batch of the last returned output batch.
+  private var current: ColumnarBatch = null
+  private var allocator: BufferAllocator = null
+  private var closed = false
+
+  context.addTaskCompletionListener[Unit](_ => close())
+
+  /**
+   * Moves the vectors of `batch` into a new batch, without copying. The producer's vectors are
+   * left empty.
+   */
+  def own(batch: ColumnarBatch): ColumnarBatch = {
+    // A vector may back several columns.
+    val owned = new IdentityHashMap[ValueVector, ColumnVector]()
+    val columns = (0 until batch.numCols()).map { i =>
+      batch.column(i) match {
+        case c: ArrowColumnVector =>
+          owned.computeIfAbsent(c.getValueVector, (vector: ValueVector) => {
+            val pair = vector.getTransferPair(allocatorFor(vector))
+            pair.transfer()
+            new ArrowColumnVector(pair.getTo)
+          })
+        case c =>
+          throw SparkException.internalError(
+            s"Expected an ArrowColumnVector in an Arrow batch, got ${c.getClass.getName}")
+      }
+    }
+    val result = new ColumnarBatch(columns.toArray, batch.numRows())
+    pending.add(result)
+    result
+  }
+
+  /** Releases the owned batch of the last returned output batch, which has been consumed. */
+  def releaseOutput(): Unit = {
+    if (current != null) {
+      current.close()
+    }
+    current = pending.poll()
+  }
+
+  def close(): Unit = {
+    if (!closed) {
+      closed = true
+      if (current != null) {
+        current.close()
+        current = null
+      }
+      pending.asScala.foreach(_.close())
+      pending.clear()
+      if (allocator != null) {
+        allocator.close()
+      }
+    }
+  }
+
+  private def allocatorFor(vector: ValueVector): BufferAllocator = {
+    if (vector.getAllocator.getRoot ne ArrowUtils.rootAllocator) {
+      vector.getAllocator
+    } else {
+      if (allocator == null) {
+        allocator = ArrowUtils.rootAllocator.newChildAllocator(
+          s"ArrowEvalPython input of task ${context.taskAttemptId()}", 0, Long.MaxValue)
+      }
+      allocator
     }
   }
 }
